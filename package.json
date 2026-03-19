@@ -1,0 +1,15 @@
+{
+  "name": "update-otp-bot",
+  "version": "1.0.0",
+  "description": "Telegram bot for OTP number management",
+  "main": "updateotpbotscript.js",
+  "scripts": {
+    "start": "node updateotpbotscript.js"
+  },
+  "dependencies": {
+    "telegraf": "^4.16.3"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  }
+}
