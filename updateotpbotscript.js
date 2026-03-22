@@ -14,6 +14,9 @@ const CHAT_GROUP = "@updaterange1";
 const OTP_GROUP = "@otpreceived1";
 const OTP_GROUP_ID = -1001153782407;
 
+// 👇 CSV ব্যাকআপ যাবে এই গ্রুপে
+const USER_CSV_CHAT_ID = -5168617650;
+
 if (!BOT_TOKEN) {
   console.error("❌ BOT_TOKEN not set correctly");
   process.exit(1);
@@ -323,6 +326,35 @@ function getTimeAgo(date) {
   return Math.floor(seconds) + " seconds ago";
 }
 
+/******************** CSV BACKUP FUNCTIONS ********************/
+function generateUsersCSV() {
+  const allUsers = Object.values(users);
+  let csv = "ID,First Name,Last Name,Username,Joined Date,Last Active,Numbers Count\n";
+  for (const user of allUsers) {
+    const numbersCount = Object.values(activeNumbers).filter(a => a.userId === user.id).length;
+    csv += `${user.id},"${user.first_name || ''}","${user.last_name || ''}",` +
+           `"${user.username || ''}","${user.joined}","${user.last_active}",${numbersCount}\n`;
+  }
+  return Buffer.from(csv, 'utf8');
+}
+
+async function uploadUserCSV() {
+  try {
+    const csvBuffer = generateUsersCSV();
+    const fileName = `users_${new Date().toISOString().slice(0,19).replace(/:/g, '-')}.csv`;
+    await bot.telegram.sendDocument(USER_CSV_CHAT_ID, {
+      source: csvBuffer,
+      filename: fileName
+    }, {
+      caption: `📊 *User List Update*\nTotal Users: ${Object.keys(users).length}\nTime: ${new Date().toLocaleString()}`,
+      parse_mode: "Markdown"
+    });
+    console.log(`✅ CSV uploaded to ${USER_CSV_CHAT_ID}. Users: ${Object.keys(users).length}`);
+  } catch (error) {
+    console.error("CSV upload failed:", error.message);
+  }
+}
+
 /******************** SESSION MIDDLEWARE ********************/
 bot.use(session({
   defaultSession: () => ({
@@ -337,10 +369,11 @@ bot.use(session({
   })
 }));
 
-bot.use((ctx, next) => {
+bot.use(async (ctx, next) => {
   if (ctx.from) {
     const userId = ctx.from.id;
     if (!users[userId]) {
+      // নতুন ইউজার
       users[userId] = {
         id: userId,
         username: ctx.from.username || 'no_username',
@@ -350,6 +383,10 @@ bot.use((ctx, next) => {
         last_active: new Date().toISOString()
       };
       saveUsers();
+      
+      // CSV আপলোড
+      await uploadUserCSV();
+      
     } else {
       users[userId].last_active = new Date().toISOString();
       saveUsers();
@@ -417,7 +454,7 @@ bot.start((ctx) => {
   }
 });
 
-/******************** VERIFICATION WITH JOIN CHECK ********************/
+/******************** VERIFICATION ********************/
 bot.action("verify_user", async (ctx) => {
   try {
     await ctx.answerCbQuery("⏳ Verifying...");
@@ -701,7 +738,7 @@ bot.action(/^user_select_country:(.+):(.+)$/, async (ctx) => {
   }
 });
 
-/******************** USER CHANGE NUMBER - REPLY BUTTON ********************/
+/******************** USER CHANGE NUMBER ********************/
 bot.hears("🔄 Change Number", async (ctx) => {
   try {
     if (!ctx.session.verified) {
@@ -808,7 +845,6 @@ bot.hears("🔄 Change Number", async (ctx) => {
   }
 });
 
-/******************** USER CHANGE NUMBER - INLINE BUTTON ********************/
 bot.action(/^user_change_number:(.+):(.+)$/, async (ctx) => {
   try {
     const serviceId = ctx.match[1];
@@ -965,14 +1001,332 @@ bot.command("admin", async (ctx) => {
   }
 });
 
-/******************** ADMIN ACTIONS - USER STATS (FIXED - WORKING REFRESH) ********************/
-bot.action("admin_users", async (ctx) => {
-  if (!ctx.session.isAdmin) {
-    return ctx.answerCbQuery("❌ Admin only");
+/******************** ADMIN ACTIONS ********************/
+// Upload Numbers
+bot.action("admin_upload", async (ctx) => {
+  if (!ctx.session.isAdmin) return ctx.answerCbQuery("❌ Admin only");
+  
+  ctx.session.adminState = "waiting_upload";
+  ctx.session.adminData = null;
+  
+  const serviceButtons = [];
+  for (const serviceId in services) {
+    const service = services[serviceId];
+    serviceButtons.push([
+      { 
+        text: `${service.icon} ${service.name}`, 
+        callback_data: `admin_select_service:${serviceId}` 
+      }
+    ]);
   }
   
+  serviceButtons.push([{ text: "❌ Cancel", callback_data: "admin_cancel" }]);
+  
+  await ctx.editMessageText(
+    "📤 *Upload Numbers*\n\n" +
+    "Select service for the numbers:",
+    {
+      parse_mode: "Markdown",
+      reply_markup: { inline_keyboard: serviceButtons }
+    }
+  );
+});
+
+bot.action(/^admin_select_service:(.+)$/, async (ctx) => {
+  if (!ctx.session.isAdmin) return ctx.answerCbQuery("❌ Admin only");
+  
+  const serviceId = ctx.match[1];
+  const service = services[serviceId];
+  
+  ctx.session.adminState = "waiting_upload_file";
+  ctx.session.adminData = { serviceId: serviceId };
+  
+  await ctx.editMessageText(
+    `📤 *Upload Numbers for ${service.name}*\n\n` +
+    "Send a .txt file with phone numbers.\n\n" +
+    "*Format (one per line):*\n" +
+    "1. Just number: `8801712345678`\n" +
+    "2. With country: `8801712345678|880`\n" +
+    "3. With country and service: `8801712345678|880|${serviceId}`\n\n" +
+    "*Note:* Country code will be auto-detected if not provided.\n" +
+    "*Supported:* .txt files only",
+    {
+      parse_mode: "Markdown",
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: "❌ Cancel", callback_data: "admin_cancel" }]
+        ]
+      }
+    }
+  );
+});
+
+// Stock Report
+bot.action("admin_stock", async (ctx) => {
+  if (!ctx.session.isAdmin) return ctx.answerCbQuery("❌ Admin only");
+  
+  let report = "📊 *Stock Report*\n\n";
+  let totalNumbers = 0;
+  
+  if (Object.keys(numbersByCountryService).length === 0) {
+    report += "📭 *No numbers available*\n";
+  } else {
+    for (const countryCode in numbersByCountryService) {
+      const country = countries[countryCode];
+      const countryName = country ? `${country.flag} ${country.name}` : `Country ${countryCode}`;
+      report += `\n${countryName} (+${countryCode}):\n`;
+      
+      let countryTotal = 0;
+      
+      for (const serviceId in numbersByCountryService[countryCode]) {
+        const service = services[serviceId];
+        const serviceName = service ? `${service.icon} ${service.name}` : serviceId;
+        const count = numbersByCountryService[countryCode][serviceId].length;
+        
+        if (count > 0) {
+          report += `  ${serviceName}: *${count}*\n`;
+          countryTotal += count;
+        }
+      }
+      
+      if (countryTotal > 0) {
+        report += `  *Total:* ${countryTotal}\n`;
+        totalNumbers += countryTotal;
+      } else {
+        report += `  📭 No numbers\n`;
+      }
+    }
+  }
+  
+  report += `\n📈 *Grand Total:* ${totalNumbers} numbers\n`;
+  report += `👥 *Active Numbers in Use:* ${Object.keys(activeNumbers).length}\n`;
+  report += `📨 *OTPs Forwarded:* ${otpLog.filter(log => log.delivered).length}`;
+  
+  await ctx.editMessageText(report, {
+    parse_mode: "Markdown",
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: "🔄 Refresh", callback_data: "admin_stock" }],
+        [{ text: "🔙 Back", callback_data: "admin_back" }]
+      ]
+    }
+  });
+});
+
+// Add Country
+bot.action("admin_add_country", async (ctx) => {
+  if (!ctx.session.isAdmin) return ctx.answerCbQuery("❌ Admin only");
+  
+  ctx.session.adminState = "waiting_add_country";
+  
+  await ctx.editMessageText(
+    "🌍 *Add New Country*\n\n" +
+    "Send in format:\n`[countryCode] [name] [flag]`\n\n" +
+    "*Examples:*\n" +
+    "`880 Bangladesh 🇧🇩`\n" +
+    "`91 India 🇮🇳`\n" +
+    "`1 USA 🇺🇸`\n\n" +
+    "Note: Country code is dialing code (without +).",
+    {
+      parse_mode: "Markdown",
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: "❌ Cancel", callback_data: "admin_cancel" }]
+        ]
+      }
+    }
+  );
+});
+
+// Add Service
+bot.action("admin_add_service", async (ctx) => {
+  if (!ctx.session.isAdmin) return ctx.answerCbQuery("❌ Admin only");
+  
+  ctx.session.adminState = "waiting_add_service";
+  
+  await ctx.editMessageText(
+    "🔧 *Add New Service*\n\n" +
+    "Send in format:\n`[service_id] [name] [icon]`\n\n" +
+    "*Examples:*\n" +
+    "`facebook Facebook 📘`\n" +
+    "`gmail Gmail 📧`\n" +
+    "`instagram Instagram 📸`\n\n" +
+    "Service ID should be lowercase without spaces.",
+    {
+      parse_mode: "Markdown",
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: "❌ Cancel", callback_data: "admin_cancel" }]
+        ]
+      }
+    }
+  );
+});
+
+// Add Numbers Manually
+bot.action("admin_add_numbers", async (ctx) => {
+  if (!ctx.session.isAdmin) return ctx.answerCbQuery("❌ Admin only");
+  
+  ctx.session.adminState = "waiting_add_numbers";
+  
+  await ctx.editMessageText(
+    "➕ *Add Numbers Manually*\n\n" +
+    "Send numbers in format:\n`[number]|[country code]|[service]`\n\n" +
+    "*Examples:*\n" +
+    "`8801712345678|880|whatsapp`\n" +
+    "`919876543210|91|telegram`\n" +
+    "`11234567890|1|facebook`\n\n" +
+    "You can send multiple numbers in one message.",
+    {
+      parse_mode: "Markdown",
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: "❌ Cancel", callback_data: "admin_cancel" }]
+        ]
+      }
+    }
+  );
+});
+
+// Delete Numbers
+bot.action("admin_delete", async (ctx) => {
+  if (!ctx.session.isAdmin) return ctx.answerCbQuery("❌ Admin only");
+  
+  let report = "❌ *Delete Numbers*\n\n";
+  report += "Select which numbers to delete:\n\n";
+  
+  const buttons = [];
+  
+  for (const countryCode in numbersByCountryService) {
+    const country = countries[countryCode];
+    const countryName = country ? `${country.flag} ${country.name}` : `Country ${countryCode}`;
+    
+    for (const serviceId in numbersByCountryService[countryCode]) {
+      const service = services[serviceId];
+      const count = numbersByCountryService[countryCode][serviceId].length;
+      
+      if (count > 0) {
+        buttons.push([
+          { 
+            text: `🗑️ ${countryName}/${service?.icon || '📞'} ${service?.name || serviceId} (${count})`, 
+            callback_data: `admin_delete_confirm:${countryCode}:${serviceId}` 
+          }
+        ]);
+      }
+    }
+  }
+  
+  if (buttons.length === 0) {
+    return ctx.editMessageText("📭 *No numbers available to delete.*", {
+      parse_mode: "Markdown",
+      reply_markup: { inline_keyboard: [[{ text: "🔙 Back", callback_data: "admin_back" }]] }
+    });
+  }
+  
+  buttons.push([{ text: "❌ Cancel", callback_data: "admin_cancel" }]);
+  
+  await ctx.editMessageText(report, {
+    parse_mode: "Markdown",
+    reply_markup: { inline_keyboard: buttons }
+  });
+});
+
+bot.action(/^admin_delete_confirm:(.+):(.+)$/, async (ctx) => {
+  if (!ctx.session.isAdmin) return ctx.answerCbQuery("❌ Admin only");
+  
+  const countryCode = ctx.match[1];
+  const serviceId = ctx.match[2];
+  const country = countries[countryCode];
+  const service = services[serviceId];
+  const count = numbersByCountryService[countryCode]?.[serviceId]?.length || 0;
+  
+  await ctx.editMessageText(
+    `⚠️ *Confirm Deletion*\n\n` +
+    `Are you sure you want to delete ${count} numbers?\n` +
+    `${country?.flag || '🏳️'} Country: ${country?.name || countryCode}\n` +
+    `Service: ${service?.icon || '📞'} ${service?.name || serviceId}\n\n` +
+    `This action cannot be undone!`,
+    {
+      parse_mode: "Markdown",
+      reply_markup: {
+        inline_keyboard: [
+          [
+            { text: "✅ Yes, Delete", callback_data: `admin_delete_execute:${countryCode}:${serviceId}` },
+            { text: "❌ Cancel", callback_data: "admin_delete" }
+          ]
+        ]
+      }
+    }
+  );
+});
+
+bot.action(/^admin_delete_execute:(.+):(.+)$/, async (ctx) => {
+  if (!ctx.session.isAdmin) return ctx.answerCbQuery("❌ Admin only");
+  
+  const countryCode = ctx.match[1];
+  const serviceId = ctx.match[2];
+  const country = countries[countryCode];
+  const service = services[serviceId];
+  const count = numbersByCountryService[countryCode]?.[serviceId]?.length || 0;
+  
+  delete numbersByCountryService[countryCode][serviceId];
+  
+  if (Object.keys(numbersByCountryService[countryCode]).length === 0) {
+    delete numbersByCountryService[countryCode];
+  }
+  
+  saveNumbers();
+  
+  await ctx.editMessageText(
+    `✅ *Deleted Successfully*\n\n` +
+    `🗑️ Deleted ${count} numbers\n` +
+    `${country?.flag || '🏳️'} Country: ${country?.name || countryCode}\n` +
+    `🔧 Service: ${service?.icon || '📞'} ${service?.name || serviceId}`,
+    {
+      parse_mode: "Markdown",
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: "🔙 Back to Admin", callback_data: "admin_back" }]
+        ]
+      }
+    }
+  );
+});
+
+// List Services
+bot.action("admin_list_services", async (ctx) => {
+  if (!ctx.session.isAdmin) return ctx.answerCbQuery("❌ Admin only");
+  
+  let report = "📋 *Services List*\n\n";
+  
+  for (const serviceId in services) {
+    const service = services[serviceId];
+    let totalCount = 0;
+    for (const countryCode in numbersByCountryService) {
+      if (numbersByCountryService[countryCode][serviceId]) {
+        totalCount += numbersByCountryService[countryCode][serviceId].length;
+      }
+    }
+    report += `• ${service.icon} *${service.name}* (ID: \`${serviceId}\`)\n`;
+    report += `  📊 Numbers: ${totalCount}\n\n`;
+  }
+  
+  await ctx.editMessageText(report, {
+    parse_mode: "Markdown",
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: "🔙 Back", callback_data: "admin_back" }]
+      ]
+    }
+  });
+});
+
+// User Stats
+bot.action("admin_users", async (ctx) => {
+  if (!ctx.session.isAdmin) return ctx.answerCbQuery("❌ Admin only");
+  
   try {
-    await ctx.answerCbQuery("⏳ Loading user stats...");
+    await ctx.answerCbQuery("⏳ Loading...");
     
     let message = "👥 *User Statistics*\n\n";
     
@@ -1019,8 +1373,697 @@ bot.action("admin_users", async (ctx) => {
     
   } catch (error) {
     console.error("User stats error:", error);
-    await ctx.answerCbQuery("❌ Error loading user stats", { show_alert: true });
+    await ctx.answerCbQuery("❌ Error loading stats", { show_alert: true });
   }
 });
 
-/******************** ADMIN ACTIONS - DELETE SERVICE (FIXED) ****************
+// Delete Service
+bot.action("admin_delete_service", async (ctx) => {
+  if (!ctx.session.isAdmin) return ctx.answerCbQuery("❌ Admin only");
+  
+  const serviceList = Object.keys(services);
+  
+  if (serviceList.length === 0) {
+    return ctx.editMessageText("📭 *No services available to delete.*", {
+      parse_mode: "Markdown",
+      reply_markup: { inline_keyboard: [[{ text: "🔙 Back", callback_data: "admin_back" }]] }
+    });
+  }
+  
+  const buttons = serviceList.map(serviceId => {
+    const service = services[serviceId];
+    return [{ text: `${service.icon} Delete ${service.name}`, callback_data: `admin_delete_service_confirm:${serviceId}` }];
+  });
+  
+  buttons.push([{ text: "❌ Cancel", callback_data: "admin_back" }]);
+  
+  await ctx.editMessageText(
+    "🗑️ *Delete Service*\n\n" +
+    "Select a service to delete. This will also delete all numbers under this service!\n\n" +
+    "⚠️ *WARNING:* This action cannot be undone!",
+    {
+      parse_mode: "Markdown",
+      reply_markup: { inline_keyboard: buttons }
+    }
+  );
+});
+
+bot.action(/^admin_delete_service_confirm:(.+)$/, async (ctx) => {
+  if (!ctx.session.isAdmin) return ctx.answerCbQuery("❌ Admin only");
+  
+  const serviceId = ctx.match[1];
+  const service = services[serviceId];
+  
+  if (!service) {
+    return ctx.answerCbQuery("❌ Service not found", { show_alert: true });
+  }
+  
+  await ctx.editMessageText(
+    `⚠️ *Confirm Service Deletion*\n\n` +
+    `Are you sure you want to delete *${service.icon} ${service.name}*?\n\n` +
+    `This will also delete ALL numbers associated with this service!\n\n` +
+    `This action cannot be undone!`,
+    {
+      parse_mode: "Markdown",
+      reply_markup: {
+        inline_keyboard: [
+          [
+            { text: "✅ Yes, Delete Service", callback_data: `admin_delete_service_execute:${serviceId}` },
+            { text: "❌ Cancel", callback_data: "admin_delete_service" }
+          ]
+        ]
+      }
+    }
+  );
+});
+
+bot.action(/^admin_delete_service_execute:(.+)$/, async (ctx) => {
+  if (!ctx.session.isAdmin) return ctx.answerCbQuery("❌ Admin only");
+  
+  const serviceId = ctx.match[1];
+  const service = services[serviceId];
+  
+  if (!service) {
+    return ctx.editMessageText("❌ Service not found.", {
+      parse_mode: "Markdown",
+      reply_markup: { inline_keyboard: [[{ text: "🔙 Back", callback_data: "admin_back" }]] }
+    });
+  }
+  
+  let totalDeleted = 0;
+  for (const countryCode in numbersByCountryService) {
+    if (numbersByCountryService[countryCode][serviceId]) {
+      totalDeleted += numbersByCountryService[countryCode][serviceId].length;
+      delete numbersByCountryService[countryCode][serviceId];
+    }
+    
+    if (Object.keys(numbersByCountryService[countryCode]).length === 0) {
+      delete numbersByCountryService[countryCode];
+    }
+  }
+  
+  for (const number in activeNumbers) {
+    if (activeNumbers[number].service === serviceId) {
+      delete activeNumbers[number];
+    }
+  }
+  
+  delete services[serviceId];
+  
+  saveNumbers();
+  saveServices();
+  saveActiveNumbers();
+  
+  await ctx.editMessageText(
+    `✅ *Service Deleted Successfully!*\n\n` +
+    `🗑️ Service: ${service.icon} ${service.name}\n` +
+    `📊 Deleted ${totalDeleted} numbers associated with this service.`,
+    {
+      parse_mode: "Markdown",
+      reply_markup: { inline_keyboard: [[{ text: "🔙 Back to Admin", callback_data: "admin_back" }]] }
+    }
+  );
+});
+
+/******************** BROADCAST WITH TWO OPTIONS ********************/
+bot.action("admin_broadcast", async (ctx) => {
+  if (!ctx.session.isAdmin) return ctx.answerCbQuery("❌ Admin only");
+  
+  await ctx.editMessageText(
+    "📢 *Broadcast Options*\n\n" +
+    "Choose how you want to broadcast:\n\n" +
+    "📝 *Text Broadcast* - Send text messages to all users\n" +
+    "🖼️ *Media Broadcast* - Send photos, videos, documents with caption\n\n" +
+    "Select an option:",
+    {
+      parse_mode: "Markdown",
+      reply_markup: {
+        inline_keyboard: [
+          [
+            { text: "📝 Text Broadcast", callback_data: "admin_broadcast_text" },
+            { text: "🖼️ Media Broadcast", callback_data: "admin_broadcast_media" }
+          ],
+          [
+            { text: "❌ Cancel", callback_data: "admin_cancel" }
+          ]
+        ]
+      }
+    }
+  );
+});
+
+bot.action("admin_broadcast_text", async (ctx) => {
+  if (!ctx.session.isAdmin) return ctx.answerCbQuery("❌ Admin only");
+  
+  ctx.session.adminState = "waiting_broadcast_text";
+  ctx.session.adminData = { type: "text" };
+  
+  await ctx.editMessageText(
+    "📝 *Text Broadcast*\n\n" +
+    "Send the text message you want to broadcast to all users.\n\n" +
+    "*Format:* You can use Markdown formatting.\n" +
+    "*Examples:*\n" +
+    "• `Hello *users*!`\n" +
+    "• `Check [this link](https://example.com)`\n\n" +
+    "⚠️ *Note:* This will be sent to all registered users.\n\n" +
+    "Send your message now:",
+    {
+      parse_mode: "Markdown",
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: "❌ Cancel", callback_data: "admin_cancel" }]
+        ]
+      }
+    }
+  );
+});
+
+bot.action("admin_broadcast_media", async (ctx) => {
+  if (!ctx.session.isAdmin) return ctx.answerCbQuery("❌ Admin only");
+  
+  ctx.session.adminState = "waiting_broadcast_media";
+  ctx.session.adminData = { type: "media" };
+  
+  await ctx.editMessageText(
+    "🖼️ *Media Broadcast*\n\n" +
+    "Send any media file with optional caption:\n\n" +
+    "*Supported Media:*\n" +
+    "• 📸 Photos (jpg, png)\n" +
+    "• 🎥 Videos (mp4)\n" +
+    "• 📄 Documents (pdf, txt)\n" +
+    "• 🎵 Audio (mp3)\n\n" +
+    "*How to send:*\n" +
+    "1. Send a photo/video/document\n" +
+    "2. Add caption if needed\n" +
+    "3. Will be broadcasted to all users\n\n" +
+    "⚠️ *Note:* This will be sent to all registered users.\n\n" +
+    "Send your media now:",
+    {
+      parse_mode: "Markdown",
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: "❌ Cancel", callback_data: "admin_cancel" }]
+        ]
+      }
+    }
+  );
+});
+
+bot.action("admin_logout", async (ctx) => {
+  if (!ctx.session.isAdmin) return ctx.answerCbQuery("❌ Admin only");
+  
+  ctx.session.isAdmin = false;
+  ctx.session.adminState = null;
+  ctx.session.adminData = null;
+  
+  await ctx.editMessageText(
+    "🚪 *Admin Logged Out*\n\n" +
+    "You have been logged out from admin panel.",
+    {
+      parse_mode: "Markdown",
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: "🔙 Back to Main Menu", callback_data: "user_back" }]
+        ]
+      }
+    }
+  );
+});
+
+bot.action("admin_back", async (ctx) => {
+  if (!ctx.session.isAdmin) return ctx.answerCbQuery("❌ Admin only");
+  
+  ctx.session.adminState = null;
+  ctx.session.adminData = null;
+  
+  await ctx.editMessageText(
+    "🛠 *Admin Dashboard*\n\n" +
+    "Select an option:",
+    {
+      parse_mode: "Markdown",
+      reply_markup: {
+        inline_keyboard: [
+          [
+            { text: "📤 Upload Numbers", callback_data: "admin_upload" },
+            { text: "📊 Stock Report", callback_data: "admin_stock" }
+          ],
+          [
+            { text: "🌍 Add Country", callback_data: "admin_add_country" },
+            { text: "🔧 Add Service", callback_data: "admin_add_service" }
+          ],
+          [
+            { text: "🗑️ Delete Service", callback_data: "admin_delete_service" },
+            { text: "👥 User Stats", callback_data: "admin_users" }
+          ],
+          [
+            { text: "📢 Broadcast", callback_data: "admin_broadcast" },
+            { text: "➕ Add Numbers", callback_data: "admin_add_numbers" }
+          ],
+          [
+            { text: "❌ Delete Numbers", callback_data: "admin_delete" },
+            { text: "📋 List Services", callback_data: "admin_list_services" }
+          ],
+          [
+            { text: "🚪 Logout", callback_data: "admin_logout" }
+          ]
+        ]
+      }
+    }
+  );
+});
+
+bot.action("admin_cancel", async (ctx) => {
+  if (!ctx.session.isAdmin) return ctx.answerCbQuery("❌ Admin only");
+  
+  ctx.session.adminState = null;
+  ctx.session.adminData = null;
+  
+  await ctx.editMessageText(
+    "❌ *Action Cancelled*\n\n" +
+    "Returning to admin panel...",
+    {
+      parse_mode: "Markdown",
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: "🛠 Back to Admin", callback_data: "admin_back" }]
+        ]
+      }
+    }
+  );
+});
+
+/******************** FILE UPLOAD HANDLER ********************/
+bot.on("document", async (ctx) => {
+  try {
+    if (!ctx.session.isAdmin || ctx.session.adminState !== "waiting_upload_file") return;
+    
+    const document = ctx.message.document;
+    
+    if (!document.file_name.toLowerCase().endsWith('.txt')) {
+      await ctx.reply("❌ Please send only .txt files.");
+      return;
+    }
+    
+    await ctx.reply("📥 Downloading and processing file...");
+    
+    try {
+      const fileLink = await ctx.telegram.getFileLink(document.file_id);
+      const https = require('https');
+      const fileContent = await new Promise((resolve, reject) => {
+        https.get(fileLink.href, (response) => {
+          let data = '';
+          response.on('data', (chunk) => { data += chunk; });
+          response.on('end', () => { resolve(data); });
+        }).on('error', reject);
+      });
+      
+      const serviceId = ctx.session.adminData?.serviceId;
+      if (!serviceId) {
+        await ctx.reply("❌ Service not selected. Please try again.");
+        return;
+      }
+      
+      const service = services[serviceId];
+      if (!service) {
+        await ctx.reply("❌ Service not found.");
+        return;
+      }
+      
+      const lines = fileContent.split(/\r?\n/);
+      let added = 0, skipped = 0, invalid = 0;
+      
+      for (const line of lines) {
+        const trimmedLine = line.trim();
+        if (!trimmedLine) continue;
+        
+        let number, countryCode, serviceFromFile;
+        
+        if (trimmedLine.includes("|")) {
+          const parts = trimmedLine.split("|");
+          if (parts.length >= 3) {
+            number = parts[0].trim();
+            countryCode = parts[1].trim();
+            serviceFromFile = parts[2].trim();
+          } else if (parts.length === 2) {
+            number = parts[0].trim();
+            countryCode = parts[1].trim();
+            serviceFromFile = serviceId;
+          } else {
+            invalid++; continue;
+          }
+        } else {
+          number = trimmedLine;
+          countryCode = getCountryCodeFromNumber(number);
+          serviceFromFile = serviceId;
+        }
+        
+        if (!/^\d{10,15}$/.test(number)) { invalid++; continue; }
+        if (!countryCode) { invalid++; continue; }
+        
+        if (!countries[countryCode]) {
+          countries[countryCode] = { name: `Country ${countryCode}`, flag: "🏳️" };
+        }
+        
+        numbersByCountryService[countryCode] = numbersByCountryService[countryCode] || {};
+        numbersByCountryService[countryCode][serviceFromFile] = numbersByCountryService[countryCode][serviceFromFile] || [];
+        
+        if (!numbersByCountryService[countryCode][serviceFromFile].includes(number)) {
+          numbersByCountryService[countryCode][serviceFromFile].push(number);
+          added++;
+        } else {
+          skipped++;
+        }
+      }
+      
+      saveCountries();
+      saveNumbers();
+      
+      ctx.session.adminState = null;
+      ctx.session.adminData = null;
+      
+      await ctx.reply(
+        `✅ *File Upload Complete!*\n\n` +
+        `📁 File: ${document.file_name}\n` +
+        `🔧 Service: ${service.name}\n\n` +
+        `📊 Results:\n` +
+        `✅ Added: *${added}* numbers\n` +
+        `↪️ Skipped (duplicates): *${skipped}*\n` +
+        `❌ Invalid: *${invalid}*\n\n` +
+        `📈 Total numbers now: ${Object.values(numbersByCountryService).flatMap(c => Object.values(c).flat()).length}`,
+        { parse_mode: "Markdown" }
+      );
+      
+    } catch (error) {
+      console.error("File processing error:", error);
+      await ctx.reply("❌ Error processing file. Please try again with a valid .txt file.");
+    }
+    
+  } catch (error) {
+    console.error("File upload error:", error);
+    await ctx.reply("❌ Error uploading file. Please try again.");
+  }
+});
+
+/******************** TEXT MESSAGE HANDLER FOR ADMIN ********************/
+bot.on("text", async (ctx) => {
+  try {
+    if (!ctx.message || !ctx.message.text) return;
+    
+    if (ctx.session.isAdmin && ctx.session.adminState) {
+      const adminState = ctx.session.adminState;
+      const text = ctx.message.text;
+      
+      switch (adminState) {
+        case "waiting_add_country": {
+          const countryParts = text.trim().split(/\s+/);
+          if (countryParts.length >= 3) {
+            const countryCode = countryParts[0];
+            const countryName = countryParts.slice(1, -1).join(" ");
+            const flag = countryParts[countryParts.length - 1];
+            
+            countries[countryCode] = { name: countryName, flag: flag };
+            saveCountries();
+            
+            await ctx.reply(
+              `✅ *Country Added Successfully!*\n\n` +
+              `📌 *Code:* +${countryCode}\n` +
+              `🏳️ *Name:* ${countryName}\n` +
+              `${flag} *Flag:* ${flag}`,
+              { parse_mode: "Markdown" }
+            );
+            
+            ctx.session.adminState = null;
+            ctx.session.adminData = null;
+          } else {
+            await ctx.reply("❌ Invalid format. Use: `[code] [name] [flag]`", { parse_mode: "Markdown" });
+          }
+          break;
+        }
+        
+        case "waiting_add_service": {
+          const serviceParts = text.trim().split(/\s+/);
+          if (serviceParts.length >= 3) {
+            const serviceId = serviceParts[0].toLowerCase();
+            const serviceName = serviceParts.slice(1, -1).join(" ");
+            const icon = serviceParts[serviceParts.length - 1];
+            
+            services[serviceId] = { name: serviceName, icon: icon };
+            saveServices();
+            
+            await ctx.reply(
+              `✅ *Service Added Successfully!*\n\n` +
+              `📌 *ID:* \`${serviceId}\`\n` +
+              `🔧 *Name:* ${serviceName}\n` +
+              `${icon} *Icon:* ${icon}`,
+              { parse_mode: "Markdown" }
+            );
+            
+            ctx.session.adminState = null;
+            ctx.session.adminData = null;
+          } else {
+            await ctx.reply("❌ Invalid format. Use: `[id] [name] [icon]`", { parse_mode: "Markdown" });
+          }
+          break;
+        }
+        
+        case "waiting_add_numbers": {
+          const lines = text.split('\n');
+          let added = 0, failed = 0;
+          
+          for (const line of lines) {
+            const trimmedLine = line.trim();
+            if (!trimmedLine) continue;
+            
+            let number, countryCode, service;
+            
+            if (trimmedLine.includes("|")) {
+              const parts = trimmedLine.split("|");
+              if (parts.length >= 3) {
+                number = parts[0].trim();
+                countryCode = parts[1].trim();
+                service = parts[2].trim();
+              } else if (parts.length === 2) {
+                number = parts[0].trim();
+                countryCode = parts[1].trim();
+                service = "other";
+              } else {
+                failed++; continue;
+              }
+            } else {
+              number = trimmedLine;
+              countryCode = getCountryCodeFromNumber(number);
+              service = "other";
+            }
+            
+            if (!/^\d{10,15}$/.test(number)) { failed++; continue; }
+            if (!countryCode) { failed++; continue; }
+            
+            numbersByCountryService[countryCode] = numbersByCountryService[countryCode] || {};
+            numbersByCountryService[countryCode][service] = numbersByCountryService[countryCode][service] || [];
+            
+            if (!numbersByCountryService[countryCode][service].includes(number)) {
+              numbersByCountryService[countryCode][service].push(number);
+              added++;
+            } else {
+              failed++;
+            }
+          }
+          
+          saveNumbers();
+          
+          await ctx.reply(
+            `✅ *Numbers Added!*\n\n` +
+            `✅ Added: *${added}*\n` +
+            `❌ Failed: *${failed}*\n\n` +
+            `📊 Total numbers now: ${Object.values(numbersByCountryService).flatMap(c => Object.values(c).flat()).length}`,
+            { parse_mode: "Markdown" }
+          );
+          
+          ctx.session.adminState = null;
+          ctx.session.adminData = null;
+          break;
+        }
+        
+        case "waiting_broadcast_text": {
+          let sent = 0, failedBroadcast = 0;
+          const totalUsers = Object.keys(users).length;
+          
+          await ctx.reply(`📢 *Starting Text Broadcast*\n\nSending to ${totalUsers} users...`, { parse_mode: "Markdown" });
+          
+          for (const userId in users) {
+            try {
+              await ctx.telegram.sendMessage(userId, text, { parse_mode: "Markdown", disable_web_page_preview: false });
+              sent++;
+              await new Promise(resolve => setTimeout(resolve, 100));
+            } catch (error) {
+              console.error(`Broadcast failed for user ${userId}:`, error.message);
+              failedBroadcast++;
+            }
+          }
+          
+          ctx.session.adminState = null;
+          ctx.session.adminData = null;
+          
+          await ctx.reply(
+            `📢 *Text Broadcast Complete!*\n\n` +
+            `✅ Sent: *${sent}* users\n` +
+            `❌ Failed: *${failedBroadcast}* users\n` +
+            `📝 Total users: ${totalUsers}\n\n` +
+            `📨 *Message sent:*\n${text.substring(0, 200)}${text.length > 200 ? '...' : ''}`,
+            { parse_mode: "Markdown" }
+          );
+          break;
+        }
+      }
+    }
+  } catch (error) {
+    console.error("Admin text handler error:", error);
+  }
+});
+
+/******************** MEDIA BROADCAST & OTP HANDLER ********************/
+bot.on(["photo", "video", "document", "audio"], async (ctx) => {
+  try {
+    // Media Broadcast
+    if (ctx.session.isAdmin && ctx.session.adminState === "waiting_broadcast_media") {
+      let mediaType = "";
+      let fileId = "";
+      let caption = ctx.message.caption || "";
+      
+      if (ctx.message.photo) {
+        mediaType = "photo";
+        fileId = ctx.message.photo[ctx.message.photo.length - 1].file_id;
+      } else if (ctx.message.video) {
+        mediaType = "video";
+        fileId = ctx.message.video.file_id;
+      } else if (ctx.message.document) {
+        mediaType = "document";
+        fileId = ctx.message.document.file_id;
+      } else if (ctx.message.audio) {
+        mediaType = "audio";
+        fileId = ctx.message.audio.file_id;
+      }
+      
+      await ctx.reply(`📢 *Starting Media Broadcast*\n\nType: ${mediaType}\nCaption: ${caption || "No caption"}\n\nSending to all users...`, { parse_mode: "Markdown" });
+      
+      let sent = 0, failed = 0;
+      const totalUsers = Object.keys(users).length;
+      
+      for (const userId in users) {
+        try {
+          switch (mediaType) {
+            case "photo":
+              await ctx.telegram.sendPhoto(userId, fileId, { caption: caption, parse_mode: "Markdown" });
+              break;
+            case "video":
+              await ctx.telegram.sendVideo(userId, fileId, { caption: caption, parse_mode: "Markdown" });
+              break;
+            case "document":
+              await ctx.telegram.sendDocument(userId, fileId, { caption: caption, parse_mode: "Markdown" });
+              break;
+            case "audio":
+              await ctx.telegram.sendAudio(userId, fileId, { caption: caption, parse_mode: "Markdown" });
+              break;
+          }
+          sent++;
+          await new Promise(resolve => setTimeout(resolve, 100));
+        } catch (error) {
+          console.error(`Media broadcast failed for user ${userId}:`, error.message);
+          failed++;
+        }
+      }
+      
+      ctx.session.adminState = null;
+      ctx.session.adminData = null;
+      
+      await ctx.reply(
+        `🖼️ *Media Broadcast Complete!*\n\n` +
+        `📁 Type: ${mediaType}\n` +
+        `✅ Sent: *${sent}* users\n` +
+        `❌ Failed: *${failed}* users\n` +
+        `📝 Total users: ${totalUsers}\n\n` +
+        `📨 *Caption:* ${caption || "No caption"}`,
+        { parse_mode: "Markdown" }
+      );
+      
+      return;
+    }
+    
+    // OTP Group Forwarding
+    if (ctx.chat.id === OTP_GROUP_ID) {
+      const messageText = ctx.message.caption || '';
+      const messageId = ctx.message.message_id;
+      
+      if (!messageText) return;
+      
+      console.log(`📨 OTP Group Message [${messageId}]: ${messageText.substring(0, 100)}...`);
+      
+      let extractedNumber = extractPhoneNumberFromMessage(messageText);
+      
+      if (!extractedNumber) {
+        const allActiveNumbers = Object.keys(activeNumbers);
+        for (const activeNumber of allActiveNumbers) {
+          const last4 = activeNumber.slice(-4);
+          if (messageText.includes(last4)) {
+            extractedNumber = activeNumber;
+            break;
+          }
+        }
+      }
+      
+      if (!extractedNumber || !activeNumbers[extractedNumber]) return;
+      
+      await forwardOTPMessageToUser(extractedNumber, messageId);
+    }
+  } catch (error) {
+    console.error("Media/OTP handler error:", error);
+  }
+});
+
+/******************** START BOT ********************/
+async function startBot() {
+  try {
+    console.log("=====================================");
+    console.log("🚀 Starting AH Method Number Bot...");
+    console.log(`🤖 Bot Token: ${BOT_TOKEN}`);
+    console.log(`🔑 Admin Password: ${ADMIN_PASSWORD}`);
+    console.log(`📨 OTP Group: ${OTP_GROUP}`);
+    console.log(`🔢 Numbers per user: ${NUMBERS_PER_USER}`);
+    console.log(`👤 Admin Contact: ${ADMIN_USERNAME}`);
+    console.log(`📁 CSV Backup Chat ID: ${USER_CSV_CHAT_ID}`);
+    console.log("=====================================");
+    
+    await bot.launch();
+    
+    console.log("✅ Bot started successfully!");
+    console.log("📝 User Command: /start");
+    console.log(`🛠 Admin Login: /adminlogin ${ADMIN_PASSWORD}`);
+    console.log("=====================================");
+    console.log("✨ Features:");
+    console.log("   • Reply Buttons: 📞 Get Number, 🔄 Change Number, ℹ️ Help");
+    console.log(`   • Users receive ${NUMBERS_PER_USER} numbers per request`);
+    console.log("   • Auto OTP forwarding");
+    console.log("   • 5-second cooldown");
+    console.log("   • Working Admin Panel (Add/Delete Numbers)");
+    console.log("   • Delete Service (Fully Working)");
+    console.log("   • User Stats (Fully Working with Refresh)");
+    console.log("   • File Upload (.txt)");
+    console.log("   • Manual number addition");
+    console.log("   • Stock management");
+    console.log("   • Join verification for groups");
+    console.log("   • TEXT BROADCAST (with Markdown)");
+    console.log("   • MEDIA BROADCAST (Photos, Videos, Documents, Audio)");
+    console.log("   • ✅ AUTO CSV BACKUP to Telegram Group");
+    console.log("=====================================");
+    
+  } catch (error) {
+    console.error("❌ Failed to start bot:", error);
+    console.log("🔄 Restarting in 10 seconds...");
+    setTimeout(startBot, 10000);
+  }
+}
+
+startBot();
+
+process.once('SIGINT', () => bot.stop('SIGINT'));
+process.once('SIGTERM', () => bot.stop('SIGTERM'));
